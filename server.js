@@ -549,14 +549,9 @@ app.get("/ics/class", async (req, res) => {
           description,
           uid: `webuntis-${l.id}@${process.env.UNTIS_SERVER ?? "webuntis"}`,
         };
-        // after computing startArr / endArr (which are local times in Europe/Brussels)
-        if (startArr) {
-          // convert local Europe/Brussels -> UTC before passing to ics
-          ev.start = toUTCArrayFromZone(startArr, "Europe/Brussels");
-        }
-        if (endArr) {
-          ev.end = toUTCArrayFromZone(endArr, "Europe/Brussels");
-        }
+
+        if (startArr) ev.start = startArr;
+        if (endArr) ev.end = endArr;
         return ev;
       });
 
@@ -726,44 +721,39 @@ app.get("/ics/class", async (req, res) => {
         generator: getVtimezoneComponent,
       });
 
-      // add events (mergedEvents contains events with .title, .description, .uid and start/end arrays)
-      for (const ev of mergedEvents) {
-        // if your ev.start / ev.end are arrays [Y,M,D,H,MM] in local Europe/Brussels
-        const toDateInZone = (arr) => {
-          if (!arr || arr.length < 5) return null;
-          const dt = DateTime.fromObject(
-            {
-              year: arr[0],
-              month: arr[1],
-              day: arr[2],
-              hour: arr[3],
-              minute: arr[4],
-            },
-            { zone: "Europe/Brussels" }
-          );
-          return dt.toJSDate(); // JS Date representing the same instant
-        };
+      const toDateInZone = (arr) => {
+        if (!arr || arr.length < 5) return null;
+        const dt = DateTime.fromObject(
+          {
+            year: arr[0],
+            month: arr[1],
+            day: arr[2],
+            hour: arr[3],
+            minute: arr[4],
+          },
+          { zone: "Europe/Brussels" }
+        );
+        return dt.toJSDate();
+      };
 
+      // add events to calendar using local Europe/Brussels times
+      for (const ev of mergedEvents) {
         const startDate = toDateInZone(ev.start);
         const endDate = toDateInZone(ev.end);
+        if (!startDate || !endDate) continue; // skip malformed
 
-        const eventData = {
+        cal.createEvent({
           start: startDate,
           end: endDate,
           summary: ev.title,
           description: ev.description,
           uid: ev.uid,
-          timezone: "Europe/Brussels", // ensure event uses TZID param
-        };
-
-        // if any field missing, drop them so ical-generator won't choke
-        cal.createEvent(eventData);
+          timezone: "Europe/Brussels",
+        });
       }
 
-      // produce ICS string
+      // produce ICS string and send
       const icsString = cal.toString();
-
-      // send it
       res.setHeader("Content-Type", "text/calendar; charset=utf-8");
       res.setHeader(
         "Content-Disposition",
