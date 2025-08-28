@@ -810,4 +810,108 @@ app.get("/schoolyears", async (req, res) => {
   }
 });
 
+// ---------- direct (no-redirect) schoolyear feed for a class ----------
+app.get("/ics/class/:id", async (req, res) => {
+  const classId = Number(req.params.id);
+  if (Number.isNaN(classId)) return res.status(400).send("id must be numeric");
+
+  const untis = makeUntisInstance();
+  try {
+    await untis.login();
+
+    // try to find the schoolyear where this class exists
+    const foundYear = await findSchoolyearContainingClass(untis, classId);
+
+    // fallback: pick schoolyear that contains today
+    let sy = foundYear;
+    if (!sy) {
+      const d = new Date();
+      const y = d.getFullYear(),
+        m = String(d.getMonth() + 1).padStart(2, "0"),
+        dd = String(d.getDate()).padStart(2, "0");
+      const todayIso = `${y}-${m}-${dd}`;
+      sy = await findSchoolyearForDate(untis, todayIso);
+    }
+
+    if (!sy) {
+      await untis.logout();
+      return res
+        .status(404)
+        .send(`Could not determine schoolyear for class ${classId}`);
+    }
+
+    // robust formatter that accepts:
+    // - number like 20250915
+    // - string like "20250915"
+    // - string like "2025-09-15"
+    // - ISO string "2025-09-15T00:00:00"
+    // - JS Date object
+    const formatYMD = (v) => {
+      if (!v && v !== 0) return null;
+      // Date object
+      if (v instanceof Date) {
+        const y = v.getFullYear();
+        const m = String(v.getMonth() + 1).padStart(2, "0");
+        const d = String(v.getDate()).padStart(2, "0");
+        return `${y}-${m}-${d}`;
+      }
+      // numeric like 20250915
+      if (typeof v === "number") v = String(v);
+      if (typeof v === "string") {
+        // clean whitespace
+        v = v.trim();
+        // "20250915"
+        if (/^\d{8}$/.test(v))
+          return `${v.slice(0, 4)}-${v.slice(4, 6)}-${v.slice(6, 8)}`;
+        // "2025-09-15"
+        if (/^\d{4}-\d{2}-\d{2}$/.test(v)) return v;
+        // ISO with time "2025-09-15T00:00:00" or "2025-09-15 00:00:00"
+        const m = /^(\d{4}-\d{2}-\d{2})[T\s]/.exec(v);
+        if (m) return m[1];
+      }
+      return null;
+    };
+
+    const start = formatYMD(sy.startDate);
+    const end = formatYMD(sy.endDate);
+    if (!start || !end) {
+      await untis.logout();
+      return res.status(500).send("Bad schoolyear date format from Untis");
+    }
+
+    // done with Untis for this route (we'll let /ics/class login itself again)
+    await untis.logout();
+
+    // build absolute URL to existing /ics/class route
+    const base = `${req.protocol}://${req.get("host")}`;
+    const targetUrl = `${base}/ics/class?id=${encodeURIComponent(
+      classId
+    )}&start=${encodeURIComponent(start)}&end=${encodeURIComponent(
+      end
+    )}&schoolyear=${encodeURIComponent(sy.id)}`;
+
+    // fetch the ICS from our own server and stream body back to the client
+    // Node 18+ exposes global fetch; if your Node lacks fetch, you'll need node-fetch/undici.
+    const fetchRes = await fetch(targetUrl);
+    const ct =
+      fetchRes.headers.get("content-type") || "text/calendar; charset=utf-8";
+    const cd =
+      fetchRes.headers.get("content-disposition") ||
+      `attachment; filename="class-${classId}.ics"`;
+    res.status(fetchRes.status);
+    res.setHeader("Content-Type", ct);
+    res.setHeader("Content-Disposition", cd);
+
+    // stream body (arrayBuffer -> Buffer for Node compatibility)
+    const buf = Buffer.from(await fetchRes.arrayBuffer());
+    res.send(buf);
+  } catch (err) {
+    try {
+      await untis.logout();
+    } catch (e) {}
+    console.error("/ics/class/:id/year error", err);
+    return res.status(500).send(err?.message || String(err));
+  }
+});
+
 app.listen(PORT, () => console.log(`Listening on ${PORT}`));
