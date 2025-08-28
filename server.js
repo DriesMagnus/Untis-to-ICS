@@ -694,6 +694,13 @@ app.get("/ics/class", async (req, res) => {
         mergedEvents.length
       );
       // ---------- Emit UTC timestamps (single conversion) ----------
+      console.log(
+        "MERGE-DEBUG: events before=",
+        events.length,
+        "after=",
+        mergedEvents.length
+      );
+
       const pad = (n, len = 2) => String(n).padStart(len, "0");
       function icsEscape(text = "") {
         return String(text)
@@ -704,11 +711,9 @@ app.get("/ics/class", async (req, res) => {
           .replace(/,/g, "\\,");
       }
       function formatUtc(dt) {
-        // dt is a Luxon DateTime in UTC
         return dt.toFormat("yyyyLLdd'T'HHmmss'Z'");
       }
 
-      // Build ICS with UTC timestamps (no TZID)
       let ics = "";
       ics += "BEGIN:VCALENDAR\r\n";
       ics += "PRODID:-//your-org//untis-ics//EN\r\n";
@@ -721,7 +726,6 @@ app.get("/ics/class", async (req, res) => {
       for (const ev of mergedEvents) {
         if (!ev.start || !ev.end) continue;
 
-        // convert local Europe/Brussels array -> Luxon in zone -> to UTC
         const startLocal = DateTime.fromObject(
           {
             year: ev.start[0],
@@ -746,7 +750,6 @@ app.get("/ics/class", async (req, res) => {
         const startUtc = startLocal.toUTC();
         const endUtc = endLocal.toUTC();
 
-        // sanity: if conversion failed skip
         if (!startUtc.isValid || !endUtc.isValid) continue;
 
         const uid =
