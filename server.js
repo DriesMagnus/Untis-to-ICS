@@ -1,9 +1,6 @@
 // server.js (ESM)
 import express from "express";
 import { WebUntis } from "webuntis";
-import { createEvents } from "ics";
-import ical from "ical-generator";
-import { getVtimezoneComponent } from "@touch4it/ical-timezones";
 import { DateTime } from "luxon";
 import dotenv from "dotenv";
 dotenv.config();
@@ -147,23 +144,6 @@ async function findSchoolyearContainingClass(untis, classId) {
     }
   }
   return null;
-}
-
-// convert a [Y,M,D,H,MM] array in Europe/Brussels into the equivalent UTC [Y,M,D,H,MM]
-function toUTCArrayFromZone(arr, zone = "Europe/Brussels") {
-  if (!arr || arr.length < 5) return null;
-  const dt = DateTime.fromObject(
-    {
-      year: Number(arr[0]),
-      month: Number(arr[1]),
-      day: Number(arr[2]),
-      hour: Number(arr[3]),
-      minute: Number(arr[4]),
-    },
-    { zone }
-  );
-  const u = dt.toUTC();
-  return [u.year, u.month, u.day, u.hour, u.minute];
 }
 
 // GET /classes?schoolyear=123  OR  /classes?date=2025-09-15
@@ -713,19 +693,8 @@ app.get("/ics/class", async (req, res) => {
         "after=",
         mergedEvents.length
       );
-
-      // ---------- Manual ICS generation with VTIMEZONE + TZID DTSTART/DTEND ----------
-      // Requires at top of file:
-      // import { getVtimezoneComponent } from '@touch4it/ical-timezones';
-      // (keep DateTime imported from luxon for DTSTAMP generation)
-
-      const tzid = "Europe/Brussels";
-      const tzComponent = getVtimezoneComponent(tzid);
-
-      // small helper: pad numbers
+      // ---------- Emit UTC timestamps (single conversion) ----------
       const pad = (n, len = 2) => String(n).padStart(len, "0");
-
-      // escape text per iCalendar rules (\, ;, newline -> \n)
       function icsEscape(text = "") {
         return String(text)
           .replace(/\\/g, "\\\\")
@@ -734,15 +703,12 @@ app.get("/ics/class", async (req, res) => {
           .replace(/;/g, "\\;")
           .replace(/,/g, "\\,");
       }
-
-      function formatLocalArray(arr) {
-        // arr: [YYYY, M, D, H, MM] -> YYYYMMDDTHHMMSS (no Z)
-        return `${pad(arr[0], 4)}${pad(arr[1])}${pad(arr[2])}T${pad(
-          arr[3]
-        )}${pad(arr[4])}00`;
+      function formatUtc(dt) {
+        // dt is a Luxon DateTime in UTC
+        return dt.toFormat("yyyyLLdd'T'HHmmss'Z'");
       }
 
-      // Build ICS string manually
+      // Build ICS with UTC timestamps (no TZID)
       let ics = "";
       ics += "BEGIN:VCALENDAR\r\n";
       ics += "PRODID:-//your-org//untis-ics//EN\r\n";
@@ -750,29 +716,49 @@ app.get("/ics/class", async (req, res) => {
       ics += "CALSCALE:GREGORIAN\r\n";
       ics += "METHOD:PUBLISH\r\n";
 
-      // append timezone component (already returns a valid VTIMEZONE block)
-      ics += tzComponent.trim() + "\r\n";
-
-      // current UTC timestamp for DTSTAMP
       const nowUtc = DateTime.utc().toFormat("yyyyLLdd'T'HHmmss'Z'");
 
       for (const ev of mergedEvents) {
-        if (!ev.start || !ev.end) continue; // skip malformed
-        // ensure start/end look sane
-        const startStr = formatLocalArray(ev.start);
-        const endStr = formatLocalArray(ev.end);
+        if (!ev.start || !ev.end) continue;
 
-        ics += "BEGIN:VEVENT\r\n";
-        // UID: ensure unique; fallback to generated if missing
+        // convert local Europe/Brussels array -> Luxon in zone -> to UTC
+        const startLocal = DateTime.fromObject(
+          {
+            year: ev.start[0],
+            month: ev.start[1],
+            day: ev.start[2],
+            hour: ev.start[3],
+            minute: ev.start[4],
+          },
+          { zone: "Europe/Brussels" }
+        );
+        const endLocal = DateTime.fromObject(
+          {
+            year: ev.end[0],
+            month: ev.end[1],
+            day: ev.end[2],
+            hour: ev.end[3],
+            minute: ev.end[4],
+          },
+          { zone: "Europe/Brussels" }
+        );
+
+        const startUtc = startLocal.toUTC();
+        const endUtc = endLocal.toUTC();
+
+        // sanity: if conversion failed skip
+        if (!startUtc.isValid || !endUtc.isValid) continue;
+
         const uid =
           ev.uid ||
           `untis-${Math.random().toString(36).slice(2)}@${
             process.env.UNTIS_SERVER ?? "untis"
           }`;
+        ics += "BEGIN:VEVENT\r\n";
         ics += `UID:${icsEscape(uid)}\r\n`;
         ics += `DTSTAMP:${nowUtc}\r\n`;
-        ics += `DTSTART;TZID=${tzid}:${startStr}\r\n`;
-        ics += `DTEND;TZID=${tzid}:${endStr}\r\n`;
+        ics += `DTSTART:${formatUtc(startUtc)}\r\n`;
+        ics += `DTEND:${formatUtc(endUtc)}\r\n`;
         ics += `SUMMARY:${icsEscape(ev.title || "Lesson")}\r\n`;
         if (ev.description)
           ics += `DESCRIPTION:${icsEscape(ev.description)}\r\n`;
@@ -781,7 +767,6 @@ app.get("/ics/class", async (req, res) => {
 
       ics += "END:VCALENDAR\r\n";
 
-      // send it
       res.setHeader("Content-Type", "text/calendar; charset=utf-8");
       res.setHeader(
         "Content-Disposition",
