@@ -172,6 +172,7 @@ app.get("/classes", async (req, res) => {
   }
 });
 
+// GET /ics/class
 // Generate ICS for a class id. Example: /ics/class?id=41213&start=2025-09-16&end=2025-09-20&schoolyear=45
 app.get("/ics/class", async (req, res) => {
   const { id, start, end, schoolyear, schoolyearDate } = req.query;
@@ -488,48 +489,39 @@ app.get("/ics/class", async (req, res) => {
             ? eventTimeFromLessonDateAndMinutes(l.date, endMin)
             : null;
 
+        // --- build title, rooms (location) and a description using lstext (no duplicate rooms) ---
         const subject =
           (l.su && l.su[0] && l.su[0].name) ||
           (l.code === "cancelled" ? "CANCELLED" : l.name || "Lesson");
+
         const teachers = (l.te || [])
           .map((t) => t.name)
           .filter(Boolean)
           .join(", ");
-        const rooms = (l.ro || [])
-          .map((r) => r.name)
-          .filter(Boolean)
-          .join(", ");
-        const descrParts = [];
-        if (teachers) descrParts.push(`Teachers: ${teachers}`);
-        if (rooms) descrParts.push(`Rooms: ${rooms}`);
-        if (l.info) descrParts.push(`Info: ${l.info}`);
-        const description = descrParts.join("\\n");
 
-        if (idx < 30) {
-          console.log("TIME-DEBUG:", {
-            id: l.id,
-            title: subject,
-            rawStartCandidates: {
-              startTime: l.startTime,
-              start: l.start,
-              startDateTime: l.startDateTime,
-              startTimestamp: l.startTimestamp,
-              begin: l.begin,
-              time: l.time,
-            },
-            chosenStart: chosen,
-            chosenEnd: chosenEnd,
-            startArr,
-            endArr,
-          });
-        }
+        // rooms (kept only as LOCATION)
+        const roomsArr = (l.ro || []).map((r) => r.name).filter(Boolean);
+        const rooms = roomsArr.join(", "); // e.g. "NOO.00.025"
+
+        // prefer lstext (type like "practicum", "hoorcollege", etc.)
+        const lstext = (l.lstext ?? l.lsText ?? l.lessonType ?? l.type ?? "")
+          .toString()
+          .trim();
+
+        // build description lines (NO rooms here — rooms are in LOCATION)
+        const descrParts = [];
+        if (lstext) descrParts.push(lstext); // e.g. "practicum"
+        if (l.info) descrParts.push(String(l.info)); // extra info if present
+        if (teachers) descrParts.push(`Teachers: ${teachers}`);
+
+        const description = descrParts.join("\n"); // real newlines
 
         const ev = {
           title: subject,
-          description,
+          description, // real newlines -> will be escaped into \n in the ICS
+          location: rooms || undefined,
           uid: `webuntis-${l.id}@${process.env.UNTIS_SERVER ?? "webuntis"}`,
         };
-
         if (startArr) ev.start = startArr;
         if (endArr) ev.end = endArr;
         return ev;
@@ -752,16 +744,17 @@ app.get("/ics/class", async (req, res) => {
 
         if (!startUtc.isValid || !endUtc.isValid) continue;
 
+        ics += "BEGIN:VEVENT\r\n";
         const uid =
           ev.uid ||
           `untis-${Math.random().toString(36).slice(2)}@${
             process.env.UNTIS_SERVER ?? "untis"
           }`;
-        ics += "BEGIN:VEVENT\r\n";
         ics += `UID:${icsEscape(uid)}\r\n`;
         ics += `DTSTAMP:${nowUtc}\r\n`;
         ics += `DTSTART:${formatUtc(startUtc)}\r\n`;
         ics += `DTEND:${formatUtc(endUtc)}\r\n`;
+        if (ev.location) ics += `LOCATION:${icsEscape(ev.location)}\r\n`;
         ics += `SUMMARY:${icsEscape(ev.title || "Lesson")}\r\n`;
         if (ev.description)
           ics += `DESCRIPTION:${icsEscape(ev.description)}\r\n`;
@@ -795,6 +788,7 @@ app.get("/ics/class", async (req, res) => {
 });
 
 // GET /schoolyears
+// Returns list of available school years
 app.get("/schoolyears", async (req, res) => {
   const untis = makeUntisInstance();
   try {
@@ -810,7 +804,8 @@ app.get("/schoolyears", async (req, res) => {
   }
 });
 
-// ---------- direct (no-redirect) schoolyear feed for a class ----------
+// GET /ics/class/:id
+// Generates an ICS for the full school year containing the specified class ID.
 app.get("/ics/class/:id", async (req, res) => {
   const classId = Number(req.params.id);
   if (Number.isNaN(classId)) return res.status(400).send("id must be numeric");
@@ -891,7 +886,6 @@ app.get("/ics/class/:id", async (req, res) => {
     )}&schoolyear=${encodeURIComponent(sy.id)}`;
 
     // fetch the ICS from our own server and stream body back to the client
-    // Node 18+ exposes global fetch; if your Node lacks fetch, you'll need node-fetch/undici.
     const fetchRes = await fetch(targetUrl);
     const ct =
       fetchRes.headers.get("content-type") || "text/calendar; charset=utf-8";
@@ -910,6 +904,35 @@ app.get("/ics/class/:id", async (req, res) => {
       await untis.logout();
     } catch (e) {}
     console.error("/ics/class/:id/year error", err);
+    return res.status(500).send(err?.message || String(err));
+  }
+});
+
+// GET /debug/lessons?id=41213&start=2025-09-15&end=2025-09-27&type=1
+app.get("/debug/lessons", async (req, res) => {
+  const { id, start, end, type } = req.query;
+  if (!id || !start || !end)
+    return res.status(400).send("Provide id,start,end (YYYY-MM-DD)");
+  const classId = Number(id);
+  const elementType = type ? Number(type) : 1;
+  try {
+    const untis = makeUntisInstance();
+    await untis.login();
+    const lessons = await untis.getTimetableForRange(
+      parseDateISO(start),
+      parseDateISO(end),
+      classId,
+      elementType
+    );
+    await untis.logout();
+    // return full JSON (pretty)
+    res.setHeader("Content-Type", "application/json; charset=utf-8");
+    return res.send(JSON.stringify(lessons, null, 2));
+  } catch (err) {
+    try {
+      await untis.logout();
+    } catch (e) {}
+    console.error("DEBUG /debug/lessons error", err);
     return res.status(500).send(err?.message || String(err));
   }
 });
