@@ -714,52 +714,80 @@ app.get("/ics/class", async (req, res) => {
         mergedEvents.length
       );
 
-      // create calendar with VTIMEZONE generator
-      const cal = ical({ name: `Class ${classId} - WebUntis` });
-      cal.timezone({
-        name: "Europe/Brussels",
-        generator: getVtimezoneComponent,
-      });
+      // ---------- Manual ICS generation with VTIMEZONE + TZID DTSTART/DTEND ----------
+      // Requires at top of file:
+      // import { getVtimezoneComponent } from '@touch4it/ical-timezones';
+      // (keep DateTime imported from luxon for DTSTAMP generation)
 
-      const toDateInZone = (arr) => {
-        if (!arr || arr.length < 5) return null;
-        const dt = DateTime.fromObject(
-          {
-            year: arr[0],
-            month: arr[1],
-            day: arr[2],
-            hour: arr[3],
-            minute: arr[4],
-          },
-          { zone: "Europe/Brussels" }
-        );
-        return dt.toJSDate();
-      };
+      const tzid = "Europe/Brussels";
+      const tzComponent = getVtimezoneComponent(tzid);
 
-      // add events to calendar using local Europe/Brussels times
-      for (const ev of mergedEvents) {
-        const startDate = toDateInZone(ev.start);
-        const endDate = toDateInZone(ev.end);
-        if (!startDate || !endDate) continue; // skip malformed
+      // small helper: pad numbers
+      const pad = (n, len = 2) => String(n).padStart(len, "0");
 
-        cal.createEvent({
-          start: startDate,
-          end: endDate,
-          summary: ev.title,
-          description: ev.description,
-          uid: ev.uid,
-          timezone: "Europe/Brussels",
-        });
+      // escape text per iCalendar rules (\, ;, newline -> \n)
+      function icsEscape(text = "") {
+        return String(text)
+          .replace(/\\/g, "\\\\")
+          .replace(/\r\n/g, "\\n")
+          .replace(/\n/g, "\\n")
+          .replace(/;/g, "\\;")
+          .replace(/,/g, "\\,");
       }
 
-      // produce ICS string and send
-      const icsString = cal.toString();
+      function formatLocalArray(arr) {
+        // arr: [YYYY, M, D, H, MM] -> YYYYMMDDTHHMMSS (no Z)
+        return `${pad(arr[0], 4)}${pad(arr[1])}${pad(arr[2])}T${pad(
+          arr[3]
+        )}${pad(arr[4])}00`;
+      }
+
+      // Build ICS string manually
+      let ics = "";
+      ics += "BEGIN:VCALENDAR\r\n";
+      ics += "PRODID:-//your-org//untis-ics//EN\r\n";
+      ics += "VERSION:2.0\r\n";
+      ics += "CALSCALE:GREGORIAN\r\n";
+      ics += "METHOD:PUBLISH\r\n";
+
+      // append timezone component (already returns a valid VTIMEZONE block)
+      ics += tzComponent.trim() + "\r\n";
+
+      // current UTC timestamp for DTSTAMP
+      const nowUtc = DateTime.utc().toFormat("yyyyLLdd'T'HHmmss'Z'");
+
+      for (const ev of mergedEvents) {
+        if (!ev.start || !ev.end) continue; // skip malformed
+        // ensure start/end look sane
+        const startStr = formatLocalArray(ev.start);
+        const endStr = formatLocalArray(ev.end);
+
+        ics += "BEGIN:VEVENT\r\n";
+        // UID: ensure unique; fallback to generated if missing
+        const uid =
+          ev.uid ||
+          `untis-${Math.random().toString(36).slice(2)}@${
+            process.env.UNTIS_SERVER ?? "untis"
+          }`;
+        ics += `UID:${icsEscape(uid)}\r\n`;
+        ics += `DTSTAMP:${nowUtc}\r\n`;
+        ics += `DTSTART;TZID=${tzid}:${startStr}\r\n`;
+        ics += `DTEND;TZID=${tzid}:${endStr}\r\n`;
+        ics += `SUMMARY:${icsEscape(ev.title || "Lesson")}\r\n`;
+        if (ev.description)
+          ics += `DESCRIPTION:${icsEscape(ev.description)}\r\n`;
+        ics += "END:VEVENT\r\n";
+      }
+
+      ics += "END:VCALENDAR\r\n";
+
+      // send it
       res.setHeader("Content-Type", "text/calendar; charset=utf-8");
       res.setHeader(
         "Content-Disposition",
         `attachment; filename="class-${classId}.ics"`
       );
-      res.send(icsString);
+      res.send(ics);
     } catch (err) {
       try {
         await untis.logout();
