@@ -2,6 +2,8 @@
 import express from "express";
 import { WebUntis } from "webuntis";
 import { createEvents } from "ics";
+import ical from "ical-generator";
+import { getVtimezoneComponent } from "@touch4it/ical-timezones";
 import { DateTime } from "luxon";
 import dotenv from "dotenv";
 dotenv.config();
@@ -717,19 +719,57 @@ app.get("/ics/class", async (req, res) => {
         mergedEvents.length
       );
 
-      // then use mergedEvents for ICS generation:
-      const { error, value } = createEvents(mergedEvents);
-      if (error) {
-        console.error("ICS create error", error);
-        throw error;
+      // create calendar with VTIMEZONE generator
+      const cal = ical({ name: `Class ${classId} - WebUntis` });
+      cal.timezone({
+        name: "Europe/Brussels",
+        generator: getVtimezoneComponent,
+      });
+
+      // add events (mergedEvents contains events with .title, .description, .uid and start/end arrays)
+      for (const ev of mergedEvents) {
+        // if your ev.start / ev.end are arrays [Y,M,D,H,MM] in local Europe/Brussels
+        const toDateInZone = (arr) => {
+          if (!arr || arr.length < 5) return null;
+          const dt = DateTime.fromObject(
+            {
+              year: arr[0],
+              month: arr[1],
+              day: arr[2],
+              hour: arr[3],
+              minute: arr[4],
+            },
+            { zone: "Europe/Brussels" }
+          );
+          return dt.toJSDate(); // JS Date representing the same instant
+        };
+
+        const startDate = toDateInZone(ev.start);
+        const endDate = toDateInZone(ev.end);
+
+        const eventData = {
+          start: startDate,
+          end: endDate,
+          summary: ev.title,
+          description: ev.description,
+          uid: ev.uid,
+          timezone: "Europe/Brussels", // ensure event uses TZID param
+        };
+
+        // if any field missing, drop them so ical-generator won't choke
+        cal.createEvent(eventData);
       }
 
+      // produce ICS string
+      const icsString = cal.toString();
+
+      // send it
       res.setHeader("Content-Type", "text/calendar; charset=utf-8");
       res.setHeader(
         "Content-Disposition",
         `attachment; filename="class-${classId}.ics"`
       );
-      res.send(value);
+      res.send(icsString);
     } catch (err) {
       try {
         await untis.logout();
