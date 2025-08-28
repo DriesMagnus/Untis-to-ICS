@@ -2,6 +2,7 @@
 import express from "express";
 import { WebUntis } from "webuntis";
 import { createEvents } from "ics";
+import { DateTime } from "luxon";
 import dotenv from "dotenv";
 dotenv.config();
 
@@ -144,6 +145,23 @@ async function findSchoolyearContainingClass(untis, classId) {
     }
   }
   return null;
+}
+
+// convert a [Y,M,D,H,MM] array in Europe/Brussels into the equivalent UTC [Y,M,D,H,MM]
+function toUTCArrayFromZone(arr, zone = "Europe/Brussels") {
+  if (!arr || arr.length < 5) return null;
+  const dt = DateTime.fromObject(
+    {
+      year: Number(arr[0]),
+      month: Number(arr[1]),
+      day: Number(arr[2]),
+      hour: Number(arr[3]),
+      minute: Number(arr[4]),
+    },
+    { zone }
+  );
+  const u = dt.toUTC();
+  return [u.year, u.month, u.day, u.hour, u.minute];
 }
 
 // GET /classes?schoolyear=123  OR  /classes?date=2025-09-15
@@ -529,8 +547,14 @@ app.get("/ics/class", async (req, res) => {
           description,
           uid: `webuntis-${l.id}@${process.env.UNTIS_SERVER ?? "webuntis"}`,
         };
-        if (startArr) ev.start = startArr;
-        if (endArr) ev.end = endArr;
+        // after computing startArr / endArr (which are local times in Europe/Brussels)
+        if (startArr) {
+          // convert local Europe/Brussels -> UTC before passing to ics
+          ev.start = toUTCArrayFromZone(startArr, "Europe/Brussels");
+        }
+        if (endArr) {
+          ev.end = toUTCArrayFromZone(endArr, "Europe/Brussels");
+        }
         return ev;
       });
 
