@@ -132,6 +132,12 @@ function subjectDisplayNameFromLesson(l) {
   return su.longname ?? su.longName ?? su.longName ?? su.name ?? null;
 }
 
+// prefer longname / longName over name for teachers
+function teacherDisplayName(t) {
+  if (!t) return "";
+  return (t.longname ?? t.longName ?? t.name ?? "").toString().trim();
+}
+
 // iso = "YYYY-MM-DD"
 function toUntisYMD(iso) {
   const [y, m, d] = iso.split("-").map(Number);
@@ -607,7 +613,7 @@ app.get("/ics/class", async (req, res) => {
           (l.code === "cancelled" ? "CANCELLED" : l.name || "Lesson");
 
         const teachers = (l.te || [])
-          .map((t) => t.name)
+          .map((t) => teacherDisplayName(t))
           .filter(Boolean)
           .join(", ");
 
@@ -997,9 +1003,10 @@ app.get("/ics/class/:id", async (req, res) => {
         (l.code === "cancelled" ? "CANCELLED" : l.name || "Lesson");
 
       const teachers = (l.te || [])
-        .map((t) => t.name)
+        .map((t) => teacherDisplayName(t))
         .filter(Boolean)
         .join(", ");
+
       const roomsArr = (l.ro || []).map((r) => r.name).filter(Boolean);
       const rooms = roomsArr.join(", ");
       const lstext = (l.lstext ?? l.lsText ?? "").toString().trim();
