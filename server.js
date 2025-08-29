@@ -17,49 +17,69 @@ function parseDateISO(iso) {
   return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
 }
 
-function normalizeUntisToMinutes(raw) {
-  if (raw == null) return null;
-  // accept strings with colon first: "08:00", "08:00:00"
+// helper: normalize raw Untis time into minutes
+function normalizeLessonTime(raw, fieldName = "") {
+  if (raw == null)
+    return { minutes: null, raw, field: fieldName, reason: "null" };
+
+  // "HH:MM" or "HH:MM:SS"
   if (typeof raw === "string" && raw.includes(":")) {
     const parts = raw.split(":").map(Number);
     if (parts.length >= 2 && !parts.some(Number.isNaN)) {
-      return parts[0] * 60 + parts[1];
+      return {
+        minutes: parts[0] * 60 + parts[1],
+        raw,
+        field: fieldName,
+        reason: "HH:MM string",
+      };
     }
   }
 
-  // coerce to number for numeric heuristics
   const v = Number(raw);
-  if (Number.isNaN(v)) return null;
+  if (Number.isNaN(v))
+    return { minutes: null, raw, field: fieldName, reason: "NaN" };
 
-  // plausible minutes already (0..1440)
-  if (v >= 0 && v <= 24 * 60) return Math.floor(v);
-
-  // if value looks like HHMMSS or HHMM (e.g. 112000, 80000, 830)
+  // HHMM or HHMMSS style
   if (v >= 100 && v <= 235959) {
     const s = String(Math.floor(v));
-    // treat last two digits as seconds, previous two as minutes, rest as hours
-    // handle both HHMM (e.g. 830 -> "0830") and HHMMSS (112000)
-    const padded = s.padStart(6, "0"); // ensures HHMMSS length
-    const hh = Number(padded.slice(0, 2));
-    const mm = Number(padded.slice(2, 4));
-    // const ss = Number(padded.slice(4,6)); // we ignore seconds
-    if (!Number.isNaN(hh) && !Number.isNaN(mm) && hh < 24 && mm < 60) {
-      return hh * 60 + mm;
+    if (s.length <= 4) {
+      const hh = Number(s.padStart(4, "0").slice(0, 2));
+      const mm = Number(s.padStart(4, "0").slice(2, 4));
+      if (hh < 24 && mm < 60)
+        return { minutes: hh * 60 + mm, raw, field: fieldName, reason: "HHMM" };
+    } else {
+      const hh = Number(s.padStart(6, "0").slice(0, 2));
+      const mm = Number(s.padStart(6, "0").slice(2, 4));
+      if (hh < 24 && mm < 60)
+        return {
+          minutes: hh * 60 + mm,
+          raw,
+          field: fieldName,
+          reason: "HHMMSS",
+        };
     }
   }
 
-  // if v looks like seconds after midnight (<= 86400)
-  if (v > 24 * 60 && v <= 24 * 60 * 60) {
-    return Math.floor(v / 60);
-  }
+  // plausible minutes
+  if (v >= 0 && v <= 1440)
+    return { minutes: Math.floor(v), raw, field: fieldName, reason: "minutes" };
 
-  // if v looks like milliseconds after midnight (> 86400)
-  if (v > 24 * 60 * 60) {
-    return Math.floor(v / 60000);
-  }
+  // seconds since midnight
+  if (v <= 86400)
+    return {
+      minutes: Math.floor(v / 60),
+      raw,
+      field: fieldName,
+      reason: "seconds",
+    };
 
-  // fallback
-  return null;
+  // ms since midnight
+  return {
+    minutes: Math.floor(v / 60000),
+    raw,
+    field: fieldName,
+    reason: "ms",
+  };
 }
 
 /**
@@ -237,9 +257,64 @@ app.get("/ics/class", async (req, res) => {
     // OPTIONAL: If you want you can return info to the client:
     console.log("Using schoolyear id:", syId ?? "none");
 
-    // Continue with parseDate and getTimetableForRange as before:
-    const s = parseDateISO(start);
-    const e = parseDateISO(end);
+    // --- allow omitting start/end: auto-detect full schoolyear for the class ---
+    let startIso = start,
+      endIso = end;
+    if (!startIso || !endIso) {
+      // we need an untis instance to detect the year — we already have `untis` logged in above
+      let sy = undefined;
+      // prefer provided schoolyear if present
+      if (schoolyear) {
+        const years = await untis.getSchoolyears();
+        sy = years.find((y) => Number(y.id) === Number(schoolyear));
+      }
+      // otherwise try to find the year that contains the class
+      if (!sy) sy = await findSchoolyearContainingClass(untis, classId);
+      // fallback: find year for a known date (e.g. today)
+      if (!sy) {
+        const d = new Date();
+        const isoToday = `${d.getFullYear()}-${String(
+          d.getMonth() + 1
+        ).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+        sy = await findSchoolyearForDate(untis, isoToday);
+      }
+      if (!sy) {
+        // if still not found, error out
+        await untis.logout();
+        return res
+          .status(404)
+          .send(
+            "Could not determine schoolyear for the class (provide start/end or schoolyear param)."
+          );
+      }
+
+      const fmt = (v) => {
+        if (!v && v !== 0) return null;
+        if (v instanceof Date)
+          return `${v.getFullYear()}-${String(v.getMonth() + 1).padStart(
+            2,
+            "0"
+          )}-${String(v.getDate()).padStart(2, "0")}`;
+        if (typeof v === "number") v = String(v);
+        if (typeof v === "string") {
+          v = v.trim();
+          if (/^\d{8}$/.test(v))
+            return `${v.slice(0, 4)}-${v.slice(4, 6)}-${v.slice(6, 8)}`;
+          if (/^\d{4}-\d{2}-\d{2}$/.test(v)) return v;
+          const m = /^(\d{4}-\d{2}-\d{2})[T\s]/.exec(v);
+          if (m) return m[1];
+        }
+        return null;
+      };
+
+      startIso = startIso || fmt(sy.startDate);
+      endIso = endIso || fmt(sy.endDate);
+    }
+
+    // now parse actual Dates
+    const s = parseDateISO(startIso);
+    const e = parseDateISO(endIso);
+
     const lessons = await untis.getTimetableForRange(s, e, classId, 1);
 
     const ELEMENT_TYPE_CLASS = 1;
@@ -260,6 +335,35 @@ app.get("/ics/class", async (req, res) => {
         classId,
         ELEMENT_TYPE_CLASS
       );
+
+      // --- filter out unwanted subjects if excludeSubjects param provided ---
+      // excludeSubjects expected as comma-separated numeric ids in query string
+      const excludeRaw = (
+        req.query.excludeSubjects ||
+        req.query.exclude ||
+        ""
+      ).toString();
+      const excludeSet = new Set(
+        excludeRaw
+          .split(",")
+          .map((x) => x.trim())
+          .filter(Boolean)
+          .map((x) => Number(x))
+          .filter((n) => !Number.isNaN(n))
+      );
+      if (excludeSet.size > 0) {
+        const before = Array.isArray(lessons) ? lessons.length : 0;
+        lessons = (lessons || []).filter((l) => {
+          const sid = l.su && l.su[0] && l.su[0].id ? Number(l.su[0].id) : null;
+          return sid == null ? true : !excludeSet.has(sid);
+        });
+        console.log(
+          `FILTER-DEBUG: excluded ${
+            before - lessons.length
+          } lessons by subjects [${[...excludeSet].join(",")}]`
+        );
+      }
+
       console.log(
         "DEBUG: lessons length",
         Array.isArray(lessons) ? lessons.length : typeof lessons
@@ -787,6 +891,250 @@ app.get("/ics/class", async (req, res) => {
   }
 });
 
+// GET /ics/class/:id
+// Generates an ICS for the full school year containing the specified class ID,
+// with optional subject filtering via ?excludeSubjects=11,22
+app.get("/ics/class/:id", async (req, res) => {
+  const classId = Number(req.params.id);
+  if (Number.isNaN(classId)) return res.status(400).send("id must be numeric");
+
+  const untis = makeUntisInstance();
+  try {
+    await untis.login();
+
+    // find schoolyear
+    let sy = await findSchoolyearContainingClass(untis, classId);
+    if (!sy) {
+      const d = new Date();
+      const todayIso = d.toISOString().slice(0, 10);
+      sy = await findSchoolyearForDate(untis, todayIso);
+    }
+    if (!sy) {
+      await untis.logout();
+      return res
+        .status(404)
+        .send(`Could not determine schoolyear for class ${classId}`);
+    }
+
+    console.log(
+      "SY DATES:",
+      typeof sy.startDate,
+      sy.startDate,
+      typeof sy.endDate,
+      sy.endDate
+    );
+
+    // robust formatter: returns "YYYY-MM-DD" for many input shapes
+    function formatYMD(v) {
+      if (v == null) return null;
+      if (v instanceof Date) {
+        const y = v.getFullYear();
+        const m = String(v.getMonth() + 1).padStart(2, "0");
+        const d = String(v.getDate()).padStart(2, "0");
+        return `${y}-${m}-${d}`;
+      }
+      if (typeof v === "number") v = String(v);
+      if (typeof v === "string") {
+        v = v.trim();
+        if (/^\d{8}$/.test(v))
+          return `${v.slice(0, 4)}-${v.slice(4, 6)}-${v.slice(6, 8)}`;
+        if (/^\d{4}-\d{2}-\d{2}$/.test(v)) return v;
+        const m = /^(\d{4}-\d{2}-\d{2})/.exec(v);
+        if (m) return m[1];
+        const d = new Date(v);
+        if (!Number.isNaN(d.getTime())) {
+          return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(
+            2,
+            "0"
+          )}-${String(d.getDate()).padStart(2, "0")}`;
+        }
+      }
+      return null;
+    }
+
+    const startIso = formatYMD(sy.startDate);
+    const endIso = formatYMD(sy.endDate);
+    if (!startIso || !endIso) {
+      await untis.logout();
+      return res.status(500).send("Bad schoolyear date format from Untis");
+    }
+
+    const ELEMENT_TYPE_CLASS = 1;
+    const s = parseDateISO(startIso);
+    const e = parseDateISO(endIso);
+
+    const lessonsRaw = await untis.getTimetableForRange(
+      s,
+      e,
+      classId,
+      ELEMENT_TYPE_CLASS
+    );
+
+    // exclusions
+    const excludeRaw = (
+      req.query.excludeSubjects ||
+      req.query.exclude ||
+      ""
+    ).toString();
+    const excludeSet = new Set(
+      excludeRaw
+        .split(",")
+        .map((x) => Number(x.trim()))
+        .filter((n) => !Number.isNaN(n))
+    );
+    let lessons = lessonsRaw;
+    if (excludeSet.size > 0) {
+      lessons = lessons.filter((l) => {
+        const sid = l.su?.[0]?.id ? Number(l.su[0].id) : null;
+        return sid == null ? true : !excludeSet.has(sid);
+      });
+    }
+
+    // events
+    let events = lessons.map((l) => {
+      const subject =
+        l.su?.[0]?.name ||
+        (l.code === "cancelled" ? "CANCELLED" : l.name || "Lesson");
+      const teachers = (l.te || [])
+        .map((t) => t.name)
+        .filter(Boolean)
+        .join(", ");
+      const roomsArr = (l.ro || []).map((r) => r.name).filter(Boolean);
+      const rooms = roomsArr.join(", ");
+      const lstext = (l.lstext ?? l.lsText ?? "").toString().trim();
+
+      const descrParts = [];
+      if (lstext) descrParts.push(lstext);
+      if (l.info) descrParts.push(String(l.info));
+      if (teachers) descrParts.push(`Teachers: ${teachers}`);
+      const description = descrParts.join("\n");
+
+      const startMin = normalizeLessonTime(l.startTime, "start").minutes;
+      const endMin = normalizeLessonTime(l.endTime, "end").minutes;
+      const startArr =
+        startMin != null
+          ? eventTimeFromLessonDateAndMinutes(l.date, startMin)
+          : null;
+      const endArr =
+        endMin != null
+          ? eventTimeFromLessonDateAndMinutes(l.date, endMin)
+          : null;
+
+      return {
+        title: subject,
+        description,
+        location: rooms || undefined,
+        uid: `webuntis-${l.id}@${process.env.UNTIS_SERVER ?? "webuntis"}`,
+        start: startArr,
+        end: endArr,
+      };
+    });
+
+    // merge consecutive events
+    const merged = [];
+    for (const ev of events.sort((a, b) => (a.start > b.start ? 1 : -1))) {
+      const last = merged[merged.length - 1];
+      if (
+        last &&
+        last.title === ev.title &&
+        last.description === ev.description &&
+        last.location === ev.location &&
+        last.end.join(",") === ev.start.join(",")
+      ) {
+        last.end = ev.end;
+      } else {
+        merged.push(ev);
+      }
+    }
+
+    // ---------- Build ICS with UTC timestamps ----------
+    const pad = (n, len = 2) => String(n).padStart(len, "0");
+    function icsEscape(text = "") {
+      return String(text)
+        .replace(/\\/g, "\\\\")
+        .replace(/\r\n/g, "\\n")
+        .replace(/\n/g, "\\n")
+        .replace(/;/g, "\\;")
+        .replace(/,/g, "\\,");
+    }
+    function formatUtc(dt) {
+      return dt.toFormat("yyyyLLdd'T'HHmmss'Z'");
+    }
+
+    let ics = "";
+    ics += "BEGIN:VCALENDAR\r\n";
+    ics += "PRODID:-//your-org//untis-ics//EN\r\n";
+    ics += "VERSION:2.0\r\n";
+    ics += "CALSCALE:GREGORIAN\r\n";
+    ics += "METHOD:PUBLISH\r\n";
+
+    const nowUtc = DateTime.utc().toFormat("yyyyLLdd'T'HHmmss'Z'");
+
+    for (const ev of merged) {
+      if (!ev.start || !ev.end) continue;
+
+      // convert local Europe/Brussels array -> Luxon (zone-aware) -> to UTC instant
+      const startLocal = DateTime.fromObject(
+        {
+          year: ev.start[0],
+          month: ev.start[1],
+          day: ev.start[2],
+          hour: ev.start[3],
+          minute: ev.start[4],
+        },
+        { zone: "Europe/Brussels" }
+      );
+      const endLocal = DateTime.fromObject(
+        {
+          year: ev.end[0],
+          month: ev.end[1],
+          day: ev.end[2],
+          hour: ev.end[3],
+          minute: ev.end[4],
+        },
+        { zone: "Europe/Brussels" }
+      );
+
+      const startUtc = startLocal.toUTC();
+      const endUtc = endLocal.toUTC();
+
+      if (!startUtc.isValid || !endUtc.isValid) continue;
+
+      const uid =
+        ev.uid ||
+        `untis-${Math.random().toString(36).slice(2)}@${
+          process.env.UNTIS_SERVER ?? "untis"
+        }`;
+
+      ics += "BEGIN:VEVENT\r\n";
+      ics += `UID:${icsEscape(uid)}\r\n`;
+      ics += `DTSTAMP:${nowUtc}\r\n`;
+      ics += `DTSTART:${formatUtc(startUtc)}\r\n`;
+      ics += `DTEND:${formatUtc(endUtc)}\r\n`;
+      if (ev.location) ics += `LOCATION:${icsEscape(ev.location)}\r\n`;
+      ics += `SUMMARY:${icsEscape(ev.title || "Lesson")}\r\n`;
+      if (ev.description) ics += `DESCRIPTION:${icsEscape(ev.description)}\r\n`;
+      ics += "END:VEVENT\r\n";
+    }
+
+    ics += "END:VCALENDAR\r\n";
+
+    res.setHeader("Content-Type", "text/calendar; charset=utf-8");
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="class-${classId}.ics"`
+    );
+    res.send(ics);
+  } catch (err) {
+    console.error("/ics/class/:id error", err);
+    res.status(500).send(err?.message || String(err));
+  } finally {
+    try {
+      await untis.logout();
+    } catch {}
+  }
+});
+
 // GET /schoolyears
 // Returns list of available school years
 app.get("/schoolyears", async (req, res) => {
@@ -801,110 +1149,6 @@ app.get("/schoolyears", async (req, res) => {
       await untis.logout();
     } catch (e) {}
     res.status(500).json({ error: err?.message || String(err) });
-  }
-});
-
-// GET /ics/class/:id
-// Generates an ICS for the full school year containing the specified class ID.
-app.get("/ics/class/:id", async (req, res) => {
-  const classId = Number(req.params.id);
-  if (Number.isNaN(classId)) return res.status(400).send("id must be numeric");
-
-  const untis = makeUntisInstance();
-  try {
-    await untis.login();
-
-    // try to find the schoolyear where this class exists
-    const foundYear = await findSchoolyearContainingClass(untis, classId);
-
-    // fallback: pick schoolyear that contains today
-    let sy = foundYear;
-    if (!sy) {
-      const d = new Date();
-      const y = d.getFullYear(),
-        m = String(d.getMonth() + 1).padStart(2, "0"),
-        dd = String(d.getDate()).padStart(2, "0");
-      const todayIso = `${y}-${m}-${dd}`;
-      sy = await findSchoolyearForDate(untis, todayIso);
-    }
-
-    if (!sy) {
-      await untis.logout();
-      return res
-        .status(404)
-        .send(`Could not determine schoolyear for class ${classId}`);
-    }
-
-    // robust formatter that accepts:
-    // - number like 20250915
-    // - string like "20250915"
-    // - string like "2025-09-15"
-    // - ISO string "2025-09-15T00:00:00"
-    // - JS Date object
-    const formatYMD = (v) => {
-      if (!v && v !== 0) return null;
-      // Date object
-      if (v instanceof Date) {
-        const y = v.getFullYear();
-        const m = String(v.getMonth() + 1).padStart(2, "0");
-        const d = String(v.getDate()).padStart(2, "0");
-        return `${y}-${m}-${d}`;
-      }
-      // numeric like 20250915
-      if (typeof v === "number") v = String(v);
-      if (typeof v === "string") {
-        // clean whitespace
-        v = v.trim();
-        // "20250915"
-        if (/^\d{8}$/.test(v))
-          return `${v.slice(0, 4)}-${v.slice(4, 6)}-${v.slice(6, 8)}`;
-        // "2025-09-15"
-        if (/^\d{4}-\d{2}-\d{2}$/.test(v)) return v;
-        // ISO with time "2025-09-15T00:00:00" or "2025-09-15 00:00:00"
-        const m = /^(\d{4}-\d{2}-\d{2})[T\s]/.exec(v);
-        if (m) return m[1];
-      }
-      return null;
-    };
-
-    const start = formatYMD(sy.startDate);
-    const end = formatYMD(sy.endDate);
-    if (!start || !end) {
-      await untis.logout();
-      return res.status(500).send("Bad schoolyear date format from Untis");
-    }
-
-    // done with Untis for this route (we'll let /ics/class login itself again)
-    await untis.logout();
-
-    // build absolute URL to existing /ics/class route
-    const base = `${req.protocol}://${req.get("host")}`;
-    const targetUrl = `${base}/ics/class?id=${encodeURIComponent(
-      classId
-    )}&start=${encodeURIComponent(start)}&end=${encodeURIComponent(
-      end
-    )}&schoolyear=${encodeURIComponent(sy.id)}`;
-
-    // fetch the ICS from our own server and stream body back to the client
-    const fetchRes = await fetch(targetUrl);
-    const ct =
-      fetchRes.headers.get("content-type") || "text/calendar; charset=utf-8";
-    const cd =
-      fetchRes.headers.get("content-disposition") ||
-      `attachment; filename="class-${classId}.ics"`;
-    res.status(fetchRes.status);
-    res.setHeader("Content-Type", ct);
-    res.setHeader("Content-Disposition", cd);
-
-    // stream body (arrayBuffer -> Buffer for Node compatibility)
-    const buf = Buffer.from(await fetchRes.arrayBuffer());
-    res.send(buf);
-  } catch (err) {
-    try {
-      await untis.logout();
-    } catch (e) {}
-    console.error("/ics/class/:id/year error", err);
-    return res.status(500).send(err?.message || String(err));
   }
 });
 
