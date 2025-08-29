@@ -138,6 +138,20 @@ function teacherDisplayName(t) {
   return (t.longname ?? t.longName ?? t.name ?? "").toString().trim();
 }
 
+// Format lstext: prefix "Info: " and capitalise first character only if it's a letter
+function formatLstext(raw) {
+  if (raw == null) return "";
+  const s = String(raw).trim();
+  if (s.length === 0) return "";
+  // unicode-aware letter test (covers accented letters)
+  const first = s[0];
+  if (first.match(/[A-Za-zÀ-ÖØ-öø-ÿ]/)) {
+    return "Info: " + first.toUpperCase() + s.slice(1);
+  }
+  // if first char is not a letter (e.g. '1'), don't change case
+  return "Info: " + s;
+}
+
 // iso = "YYYY-MM-DD"
 function toUntisYMD(iso) {
   const [y, m, d] = iso.split("-").map(Number);
@@ -622,9 +636,8 @@ app.get("/ics/class", async (req, res) => {
         const rooms = roomsArr.join(", "); // e.g. "NOO.00.025"
 
         // prefer lstext (type like "practicum", "hoorcollege", etc.)
-        const lstext = (l.lstext ?? l.lsText ?? l.lessonType ?? l.type ?? "")
-          .toString()
-          .trim();
+        const rawLstext = l.lstext ?? l.lsText ?? l.lessonType ?? l.type ?? "";
+        const lstext = formatLstext(rawLstext);
 
         // build description lines (NO rooms here — rooms are in LOCATION)
         const descrParts = [];
@@ -1009,7 +1022,8 @@ app.get("/ics/class/:id", async (req, res) => {
 
       const roomsArr = (l.ro || []).map((r) => r.name).filter(Boolean);
       const rooms = roomsArr.join(", ");
-      const lstext = (l.lstext ?? l.lsText ?? "").toString().trim();
+      const rawLstext = l.lstext ?? l.lsText ?? l.lessonType ?? l.type ?? "";
+      const lstext = formatLstext(rawLstext);
 
       const descrParts = [];
       if (lstext) descrParts.push(lstext);
