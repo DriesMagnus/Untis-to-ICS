@@ -1177,11 +1177,27 @@ app.get("/ics/class/:id", async (req, res) => {
 
       if (!startUtc.isValid || !endUtc.isValid) continue;
 
-      const uid =
-        ev.uid ||
-        `untis-${Math.random().toString(36).slice(2)}@${
-          process.env.UNTIS_SERVER ?? "untis"
-        }`;
+      // deterministic UID per merged event (based on class + start + end)
+      function uidFromEvent(ev) {
+        const pad = (n, len = 2) => String(n).padStart(len, "0");
+        const s = ev.start
+          ? `${ev.start[0]}${pad(ev.start[1])}${pad(ev.start[2])}T${pad(
+              ev.start[3]
+            )}${pad(ev.start[4])}`
+          : "nostart";
+        const e = ev.end
+          ? `${ev.end[0]}${pad(ev.end[1])}${pad(ev.end[2])}T${pad(
+              ev.end[3]
+            )}${pad(ev.end[4])}`
+          : "noend";
+        const base = `class${classId}-${s}-${e}`;
+        const host = (process.env.UNTIS_SERVER || req.get("host") || "untis")
+          .toString()
+          .replace(/\s+/g, "");
+        return `${base}@${host}`;
+      }
+
+      const uid = uidFromEvent(ev);
 
       ics += "BEGIN:VEVENT\r\n";
       ics += `UID:${icsEscape(uid)}\r\n`;
