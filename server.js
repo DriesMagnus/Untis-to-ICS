@@ -124,6 +124,14 @@ function makeUntisInstance() {
   );
 }
 
+// prefer longname / longName over name for subject display
+function subjectDisplayNameFromLesson(l) {
+  const su = l && l.su && l.su[0];
+  if (!su) return null;
+  // prefer common longname variants, then name
+  return su.longname ?? su.longName ?? su.longName ?? su.name ?? null;
+}
+
 // iso = "YYYY-MM-DD"
 function toUntisYMD(iso) {
   const [y, m, d] = iso.split("-").map(Number);
@@ -595,7 +603,7 @@ app.get("/ics/class", async (req, res) => {
 
         // --- build title, rooms (location) and a description using lstext (no duplicate rooms) ---
         const subject =
-          (l.su && l.su[0] && l.su[0].name) ||
+          subjectDisplayNameFromLesson(l) ||
           (l.code === "cancelled" ? "CANCELLED" : l.name || "Lesson");
 
         const teachers = (l.te || [])
@@ -985,8 +993,9 @@ app.get("/ics/class/:id", async (req, res) => {
     // events
     let events = lessons.map((l) => {
       const subject =
-        l.su?.[0]?.name ||
+        subjectDisplayNameFromLesson(l) ||
         (l.code === "cancelled" ? "CANCELLED" : l.name || "Lesson");
+
       const teachers = (l.te || [])
         .map((t) => t.name)
         .filter(Boolean)
