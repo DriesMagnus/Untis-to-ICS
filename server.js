@@ -916,14 +916,6 @@ app.get("/ics/class/:id", async (req, res) => {
         .send(`Could not determine schoolyear for class ${classId}`);
     }
 
-    console.log(
-      "SY DATES:",
-      typeof sy.startDate,
-      sy.startDate,
-      typeof sy.endDate,
-      sy.endDate
-    );
-
     // robust formatter: returns "YYYY-MM-DD" for many input shapes
     function formatYMD(v) {
       if (v == null) return null;
@@ -1030,22 +1022,107 @@ app.get("/ics/class/:id", async (req, res) => {
       };
     });
 
-    // merge consecutive events
-    const merged = [];
-    for (const ev of events.sort((a, b) => (a.start > b.start ? 1 : -1))) {
-      const last = merged[merged.length - 1];
-      if (
-        last &&
-        last.title === ev.title &&
-        last.description === ev.description &&
-        last.location === ev.location &&
-        last.end.join(",") === ev.start.join(",")
-      ) {
-        last.end = ev.end;
+    // ---------- robust merge: merge overlapping/adjacent identical events ----------
+    const MERGE_TOLERANCE_MIN = 1; // merge when gap <= 1 minute
+    const MERGE_DEBUG = process.env.MERGE_DEBUG === "1";
+
+    // normalize identity used for merging
+    function normalizeIdentity(e) {
+      const title = (e.title ?? "").toString().trim().replace(/\s+/g, " ");
+      const desc = (e.description ?? "").toString().trim().replace(/\s+/g, " ");
+      const loc = (e.location ?? "").toString().trim().replace(/\s+/g, " ");
+      return `${title}||${desc}||${loc}`;
+    }
+
+    // epoch minutes computed from local Europe/Brussels wall-clock
+    function epochMinutesFromLocalArray(arr) {
+      if (!arr || arr.length < 5) return null;
+      const dt = DateTime.fromObject(
+        {
+          year: Number(arr[0]),
+          month: Number(arr[1]),
+          day: Number(arr[2]),
+          hour: Number(arr[3]),
+          minute: Number(arr[4]),
+        },
+        { zone: "Europe/Brussels" }
+      );
+      if (!dt.isValid) return null;
+      return Math.floor(dt.toUTC().toMillis() / 60000); // epoch minutes UTC
+    }
+
+    // convert epoch minutes back into local [Y,M,D,H,MM] in Europe/Brussels
+    function localArrayFromEpochMinutes(epochMin) {
+      const dt = DateTime.fromMillis(epochMin * 60000, { zone: "UTC" }).setZone(
+        "Europe/Brussels"
+      );
+      return [dt.year, dt.month, dt.day, dt.hour, dt.minute];
+    }
+
+    // sort events by start epoch (stable)
+    events = (events || []).slice().map((e) => ({ ...e })); // shallow copy
+    events.sort((A, B) => {
+      const a = epochMinutesFromLocalArray(A.start) ?? 0;
+      const b = epochMinutesFromLocalArray(B.start) ?? 0;
+      if (a !== b) return a - b;
+      return normalizeIdentity(A).localeCompare(normalizeIdentity(B));
+    });
+
+    // merging pass: merge overlapping/adjacent events with identical identity
+    const mergedEvents = [];
+    for (const ev of events) {
+      const evStart = epochMinutesFromLocalArray(ev.start);
+      const evEnd = epochMinutesFromLocalArray(ev.end);
+      if (evStart == null || evEnd == null) {
+        // can't reason about times -> push as-is
+        mergedEvents.push({ ...ev });
+        continue;
+      }
+
+      if (mergedEvents.length === 0) {
+        mergedEvents.push({ ...ev });
+        continue;
+      }
+
+      const last = mergedEvents[mergedEvents.length - 1];
+      const lastStart = epochMinutesFromLocalArray(last.start);
+      const lastEnd = epochMinutesFromLocalArray(last.end);
+      if (lastStart == null || lastEnd == null) {
+        mergedEvents.push({ ...ev });
+        continue;
+      }
+
+      const sameIdentity = normalizeIdentity(last) === normalizeIdentity(ev);
+      const gap = evStart - lastEnd; // minutes (can be negative if overlap)
+
+      if (sameIdentity && gap <= MERGE_TOLERANCE_MIN) {
+        // merge: extend last.end to max(lastEnd, evEnd)
+        const newEnd = Math.max(lastEnd, evEnd);
+        last.end = localArrayFromEpochMinutes(newEnd);
+        if (MERGE_DEBUG) {
+          console.log("MERGE: merged", {
+            title: last.title,
+            mergedGap: gap,
+            newEnd,
+          });
+        }
       } else {
-        merged.push(ev);
+        // no merge -> push as separate event
+        if (MERGE_DEBUG) {
+          console.log("MERGE: no-merge", {
+            titleLast: last.title,
+            titleCur: ev.title,
+            identityEqual: sameIdentity,
+            gap,
+          });
+        }
+        mergedEvents.push({ ...ev });
       }
     }
+
+    console.log(
+      `MERGE-DEBUG: events before=${events.length} after=${mergedEvents.length}`
+    );
 
     // ---------- Build ICS with UTC timestamps ----------
     const pad = (n, len = 2) => String(n).padStart(len, "0");
@@ -1070,7 +1147,7 @@ app.get("/ics/class/:id", async (req, res) => {
 
     const nowUtc = DateTime.utc().toFormat("yyyyLLdd'T'HHmmss'Z'");
 
-    for (const ev of merged) {
+    for (const ev of mergedEvents) {
       if (!ev.start || !ev.end) continue;
 
       // convert local Europe/Brussels array -> Luxon (zone-aware) -> to UTC instant
