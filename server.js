@@ -1,4 +1,3 @@
-// server.js (ESM) — cleaned & refactored
 import express from "express";
 import { WebUntis } from "webuntis";
 import { DateTime } from "luxon";
@@ -9,6 +8,16 @@ const app = express();
 app.use(express.json());
 const PORT = process.env.PORT || 3000;
 const UNTIS_ZONE = "Europe/Brussels";
+
+app.set("trust proxy", true);
+app.use((req, res, next) => {
+  const ip = req.ip.replace(/^::ffff:/, "");
+
+  console.log(
+    `\n[${req.method}] IP: ${ip} | UA: ${req.headers["user-agent"] || "-"}`
+  );
+  next();
+});
 
 function makeUntisInstance() {
   return new WebUntis(
@@ -55,33 +64,42 @@ function toUntisYMD(iso) {
 async function findSchoolyearForDate(untis, dateIso) {
   const ymd = toUntisYMD(dateIso);
   const years = await untis.getSchoolyears();
+
   return (
     years.find((y) => {
-      const start = Number(y.startDate);
-      const end = Number(y.endDate);
-      return start <= ymd && ymd <= end;
+      let startYmd, endYmd;
+
+      if (y.startDate instanceof Date) {
+        startYmd =
+          y.startDate.getFullYear() * 10000 +
+          (y.startDate.getMonth() + 1) * 100 +
+          y.startDate.getDate();
+      } else if (typeof y.startDate === "string") {
+        const startMatch = y.startDate.match(/(\d{4})-(\d{2})-(\d{2})/);
+        startYmd = startMatch
+          ? parseInt(startMatch[1] + startMatch[2] + startMatch[3])
+          : 0;
+      } else {
+        startYmd = Number(y.startDate) || 0;
+      }
+
+      if (y.endDate instanceof Date) {
+        endYmd =
+          y.endDate.getFullYear() * 10000 +
+          (y.endDate.getMonth() + 1) * 100 +
+          y.endDate.getDate();
+      } else if (typeof y.endDate === "string") {
+        const endMatch = y.endDate.match(/(\d{4})-(\d{2})-(\d{2})/);
+        endYmd = endMatch
+          ? parseInt(endMatch[1] + endMatch[2] + endMatch[3])
+          : 99999999;
+      } else {
+        endYmd = Number(y.endDate) || 99999999;
+      }
+
+      return startYmd <= ymd && ymd <= endYmd;
     }) || null
   );
-}
-
-async function findSchoolyearContainingClass(untis, classId) {
-  const years = await untis.getSchoolyears();
-  for (const y of years) {
-    try {
-      const classes = await untis.getClasses(undefined, y.id);
-      if (
-        Array.isArray(classes) &&
-        classes.some((c) => Number(c.id) === Number(classId))
-      )
-        return y;
-    } catch (err) {
-      console.warn(
-        `Warning: getClasses failed for schoolyear ${y.id}:`,
-        err?.message ?? err
-      );
-    }
-  }
-  return null;
 }
 
 function subjectDisplayNameFromLesson(l) {
@@ -316,7 +334,7 @@ function buildIcs(mergedEvents, classId, req) {
   const nowUtc = DateTime.utc().toFormat("yyyyLLdd'T'HHmmss'Z'");
   let ics = "";
   ics +=
-    "BEGIN:VCALENDAR\r\nPRODID:-//your-org//untis-ics//EN\r\nVERSION:2.0\r\nCALSCALE:GREGORIAN\r\nMETHOD:PUBLISH\r\n";
+    "BEGIN:VCALENDAR\r\nPRODID:-//MadeByDriesMagnus//untis-ics//EN\r\nVERSION:2.0\r\nCALSCALE:GREGORIAN\r\nMETHOD:PUBLISH\r\n";
 
   for (const ev of mergedEvents) {
     if (!ev.start || !ev.end) continue;
@@ -375,30 +393,40 @@ async function determineRangeForClass(
       const years = await untis.getSchoolyears();
       sy = years.find((y) => Number(y.id) === syId);
     }
-    if (!sy) sy = await findSchoolyearContainingClass(untis, classId);
+
     if (!sy) {
       const d = new Date();
-      sy = await findSchoolyearForDate(
-        untis,
-        `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(
-          2,
-          "0"
-        )}-${String(d.getDate()).padStart(2, "0")}`
-      );
-    }
-    if (!sy) throw new Error("Could not determine schoolyear for the class");
-    syId = sy.id;
-    startIso = startIso || formatYMD(sy.startDate);
-    endIso = endIso || formatYMD(sy.endDate);
-  }
+      const todayIso = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(
+        2,
+        "0"
+      )}-${String(d.getDate()).padStart(2, "0")}`;
+      sy = await findSchoolyearForDate(untis, todayIso);
 
-  const s = parseDateISO(startIso);
-  const e = parseDateISO(endIso);
-  return { s, e, syId, startIso, endIso };
+      if (!sy) {
+        const d = new Date();
+        sy = await findSchoolyearForDate(
+          untis,
+          `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(
+            2,
+            "0"
+          )}-${String(d.getDate()).padStart(2, "0")}`
+        );
+      }
+      if (!sy) throw new Error("Could not determine schoolyear for the class");
+      syId = sy.id;
+      startIso = startIso || formatYMD(sy.startDate);
+      endIso = endIso || formatYMD(sy.endDate);
+    }
+
+    const s = parseDateISO(startIso);
+    const e = parseDateISO(endIso);
+    return { s, e, syId, startIso, endIso };
+  }
 }
 
 /* Routes */
 
+// /classes?start=...&end=...  (range required) -> returns all classes
 app.get("/classes", async (req, res) => {
   const { schoolyear, date } = req.query;
   const untis = makeUntisInstance();
@@ -410,6 +438,15 @@ app.get("/classes", async (req, res) => {
       if (found) syId = found.id;
     }
     const classes = await untis.getClasses(undefined, syId);
+
+    // Logging
+    console.log(
+      "[GET] /classes:",
+      "Pulled",
+      classes ? classes.length : 0,
+      "classes"
+    );
+
     await untis.logout();
     res.json({ schoolyear: syId ?? null, classes });
   } catch (err) {
@@ -420,11 +457,21 @@ app.get("/classes", async (req, res) => {
   }
 });
 
+// /schoolyears -> returns all schoolyears
 app.get("/schoolyears", async (req, res) => {
   const untis = makeUntisInstance();
   try {
     await untis.login();
     const years = await untis.getSchoolyears();
+
+    // Logging
+    console.log(
+      "[GET] /schoolyears:",
+      "Pulled",
+      years ? years.length : 0,
+      "schoolyear(s)"
+    );
+
     await untis.logout();
     res.json(years);
   } catch (err) {
@@ -435,7 +482,8 @@ app.get("/schoolyears", async (req, res) => {
   }
 });
 
-app.get("/debug/lessons", async (req, res) => {
+// /lessons?id=...&start=...&end=...  (id, range required) -> returns all lessons for class
+app.get("/lessons", async (req, res) => {
   const { id, start, end, type } = req.query;
   if (!id || !start || !end)
     return res.status(400).send("Provide id,start,end (YYYY-MM-DD)");
@@ -450,6 +498,25 @@ app.get("/debug/lessons", async (req, res) => {
       classId,
       elementType
     );
+
+    // Logging
+    const classInfo = (await untis.getClasses()).find(
+      (c) => Number(c.id) === classId
+    );
+    const className = classInfo
+      ? classInfo.name || classInfo.longName || `ID ${classId}`
+      : `ID ${classId}`;
+    console.log(
+      "[GET] /lessons:",
+      "Pulled",
+      lessons ? lessons.length : 0,
+      "raw lessons for class",
+      classId,
+      "(",
+      className,
+      ")"
+    );
+
     await untis.logout();
     res.setHeader("Content-Type", "application/json; charset=utf-8");
     res.send(JSON.stringify(lessons, null, 2));
@@ -459,6 +526,91 @@ app.get("/debug/lessons", async (req, res) => {
     } catch {}
     console.error("DEBUG /debug/lessons error", err);
     res.status(500).send(err?.message || String(err));
+  }
+});
+
+// /subjects/class/:id  -> returns all subjects for class
+app.get("/subjects/class/:id", async (req, res) => {
+  const classId = Number(req.params.id);
+  if (Number.isNaN(classId)) return res.status(400).send("id must be numeric");
+
+  const { schoolyear, start, end } = req.query;
+  const untis = makeUntisInstance();
+
+  try {
+    await untis.login();
+
+    const range = await determineRangeForClass(
+      untis,
+      classId,
+      start,
+      end,
+      schoolyear
+    );
+
+    const lessons = await untis.getTimetableForRange(
+      range.s,
+      range.e,
+      classId,
+      1
+    );
+
+    const subjectsMap = new Map();
+
+    for (const lesson of lessons || []) {
+      const subjects = lesson.su || [];
+      for (const subject of subjects) {
+        if (subject && subject.id) {
+          subjectsMap.set(Number(subject.id), {
+            id: Number(subject.id),
+            name: subject.name || "",
+            longName:
+              subject.longname || subject.longName || subject.name || "",
+          });
+        }
+      }
+    }
+
+    const subjects = Array.from(subjectsMap.values()).sort((a, b) =>
+      a.longName.localeCompare(b.longName)
+    );
+
+    // Logging
+    const classInfo = (await untis.getClasses()).find(
+      (c) => Number(c.id) === classId
+    );
+    const className = classInfo
+      ? classInfo.name || classInfo.longName || `ID ${classId}`
+      : `ID ${classId}`;
+    console.log(
+      "[GET] /subjects/class/:id:",
+      "Pulled",
+      subjects ? subjects.length : 0,
+      "subjects for class",
+      classId,
+      "(",
+      className,
+      ")"
+    );
+
+    await untis.logout();
+
+    res.json({
+      classId,
+      dateRange: {
+        start: range.startIso,
+        end: range.endIso,
+        schoolyearId: range.syId,
+      },
+      totalLessons: lessons ? lessons.length : 0,
+      subjects,
+    });
+  } catch (err) {
+    try {
+      await untis.logout();
+    } catch {}
+    console.error("Error /subjects/class/:id", err);
+    res.status(500).json({ error: err?.message || String(err) });
   }
 });
 
@@ -495,6 +647,24 @@ app.get("/ics/class", async (req, res) => {
       });
     }
 
+    // Logging
+    const classInfo = (await untis.getClasses()).find(
+      (c) => Number(c.id) === classId
+    );
+    const className = classInfo
+      ? classInfo.name || classInfo.longName || `ID ${classId}`
+      : `ID ${classId}`;
+    console.log(
+      "[GET] /ics/class:",
+      "Created ICS | Pulled",
+      lessons ? lessons.length : 0,
+      "lessons for class",
+      classId,
+      "(",
+      className,
+      ")"
+    );
+
     await untis.logout();
 
     const events = buildEventsFromLessons(lessons);
@@ -522,6 +692,7 @@ app.get("/ics/class/:id", async (req, res) => {
   const untis = makeUntisInstance();
   try {
     await untis.login();
+
     const { s, e } = await determineRangeForClass(
       untis,
       classId,
@@ -549,6 +720,24 @@ app.get("/ics/class/:id", async (req, res) => {
       });
     }
 
+    // Logging
+    const classInfo = (await untis.getClasses()).find(
+      (c) => Number(c.id) === classId
+    );
+    const className = classInfo
+      ? classInfo.name || classInfo.longName || `ID ${classId}`
+      : `ID ${classId}`;
+    console.log(
+      "[GET] /ics/class/:id:",
+      "Created ICS | Pulled",
+      lessons ? lessons.length : 0,
+      "lessons for class",
+      classId,
+      "(",
+      className,
+      ")"
+    );
+
     await untis.logout();
 
     const events = buildEventsFromLessons(lessons);
@@ -569,4 +758,4 @@ app.get("/ics/class/:id", async (req, res) => {
   }
 });
 
-app.listen(PORT, () => console.log(`Listening on ${PORT}`));
+app.listen(PORT, () => console.log(`[APP] Listening on ${PORT}`));
